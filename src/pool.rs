@@ -13,6 +13,10 @@ pub fn allocated_slab_count() -> usize {
     ALLOCATED_SLAB_COUNT.load(Ordering::Relaxed)
 }
 
+pub fn allocated_bytes() -> usize {
+    allocated_slab_count() * SLAB_SIZE
+}
+
 pub(crate) enum Message {
     Store {
         bytes: bytes::Bytes,

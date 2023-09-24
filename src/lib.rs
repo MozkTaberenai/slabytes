@@ -1,7 +1,7 @@
 mod pool;
 
 use bytes::{Buf, BytesMut};
-pub use pool::{allocated_slab_count, SLAB_SIZE};
+pub use pool::{allocated_bytes, allocated_slab_count, SLAB_SIZE};
 use std::collections::VecDeque;
 use std::sync::{mpsc, Arc};
 
