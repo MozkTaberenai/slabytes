@@ -1,138 +1,81 @@
-use rustc_hash::FxHasher;
+use crate::{Slabytes, DEFAULT_CHUNK_SIZE};
+use rustc_hash::FxHashMap;
 use sharded_slab::pool::OwnedRef;
-use std::collections::{hash_map::Entry, HashMap};
-use std::hash::BuildHasherDefault;
+use sharded_slab::{Config, DefaultConfig};
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Weak};
-use tracing::{debug, error};
+use std::sync::{Arc, RwLock, Weak};
 
-pub const SLAB_SIZE: usize = 512;
-static ALLOCATED_SLAB_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-pub fn allocated_slab_count() -> usize {
-    ALLOCATED_SLAB_COUNT.load(Ordering::Relaxed)
-}
-
-pub fn allocated_bytes() -> usize {
-    allocated_slab_count() * SLAB_SIZE
-}
-
-pub(crate) enum Message {
-    Store {
-        bytes: bytes::Bytes,
-        result_tx: std::sync::mpsc::Sender<Result<Arc<SlabRef>, Error>>,
-    },
-
-    #[cfg(feature = "tokio")]
-    TokioStore {
-        bytes: bytes::Bytes,
-        result_tx: ::tokio::sync::oneshot::Sender<Result<Arc<SlabRef>, Error>>,
-    },
-
-    Drop {
-        #[allow(dead_code)]
-        slab_ref: OwnedRef<Slab>,
-        crc: u32,
-    },
+#[derive(Debug)]
+pub struct Pool<const CHUNK_SIZE: usize = DEFAULT_CHUNK_SIZE, C: Config = DefaultConfig> {
+    inner: Arc<sharded_slab::Pool<Chunk<CHUNK_SIZE>, C>>,
+    crc_map: Arc<RwLock<FxHashMap<u32, WeakChunkRefs<CHUNK_SIZE, C>>>>,
+    chunk_count: AtomicUsize,
 }
 
 #[derive(Debug)]
-pub(crate) enum Error {
-    SlabTooLarge,
+enum WeakChunkRefs<const SIZE: usize, C: Config> {
+    One(Weak<StoredChunkRef<SIZE, C>>),
+    Many(Vec<Weak<StoredChunkRef<SIZE, C>>>),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::SlabTooLarge => write!(f, "Slab must be less than {SLAB_SIZE}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub(crate) fn actor() -> &'static mpsc::Sender<Message> {
-    use std::sync::OnceLock;
-    static TX: OnceLock<mpsc::Sender<Message>> = OnceLock::new();
-    TX.get_or_init(spawn_actor)
-}
-
-fn spawn_actor() -> mpsc::Sender<Message> {
-    let (tx, rx) = mpsc::channel();
-    let mut pool = Pool::new(tx.clone());
-    let tx_clone = tx.clone();
-    std::thread::Builder::new()
-        .name("slab-pool-actor".into())
-        .spawn(move || {
-            debug!("pool actor started");
-            for msg in rx {
-                match msg {
-                    Message::Store { bytes, result_tx } => {
-                        if result_tx.send(pool.store_slab(&bytes)).is_err() {
-                            error!("fail to send");
-                        }
-                    }
-
-                    #[cfg(feature = "tokio")]
-                    Message::TokioStore { bytes, result_tx } => {
-                        if result_tx.send(pool.store_slab(&bytes)).is_err() {
-                            error!("fail to send");
-                        }
-                    }
-
-                    Message::Drop { crc, .. } => pool.clear_crc(crc),
-                }
-            }
-            debug!("pool actor shutdown");
+impl<const CHUNK_SIZE: usize> Pool<CHUNK_SIZE> {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(sharded_slab::Pool::<Chunk<CHUNK_SIZE>>::new()),
+            crc_map: Default::default(),
+            chunk_count: Default::default(),
         })
-        .unwrap();
-    tx_clone
-}
-
-struct Pool {
-    inner: Arc<sharded_slab::Pool<Slab>>,
-    crc: HashMap<u32, WeakSlabRefs, BuildHasherDefault<FxHasher>>,
-    tx: mpsc::Sender<Message>,
-}
-
-enum WeakSlabRefs {
-    One(Weak<SlabRef>),
-    Many(Vec<Weak<SlabRef>>),
-}
-
-impl Pool {
-    pub fn new(tx: mpsc::Sender<Message>) -> Self {
-        Self {
-            inner: Arc::new(sharded_slab::Pool::<Slab>::new()),
-            crc: HashMap::default(),
-            tx,
-        }
     }
 
-    pub fn store_slab(&mut self, slab: &[u8]) -> Result<Arc<SlabRef>, Error> {
-        if slab.len() > SLAB_SIZE {
-            return Err(Error::SlabTooLarge);
-        }
+    pub fn new_with_config<C: Config>() -> Arc<Pool<CHUNK_SIZE, C>> {
+        Arc::new(Pool {
+            inner: Arc::new(sharded_slab::Pool::<Chunk<CHUNK_SIZE>>::new_with_config::<C>()),
+            crc_map: Default::default(),
+            chunk_count: Default::default(),
+        })
+    }
+}
 
-        let crc = crc32fast::hash(slab);
+impl<const CHUNK_SIZE: usize, C: Config> Pool<CHUNK_SIZE, C> {
+    pub const fn chunk_size(&self) -> usize {
+        CHUNK_SIZE
+    }
+
+    pub fn stored_chunk_count(&self) -> usize {
+        self.chunk_count.load(Ordering::Relaxed)
+    }
+
+    pub fn stored_bytes(&self) -> usize {
+        self.stored_chunk_count() * CHUNK_SIZE
+    }
+
+    pub(crate) fn store_chunk(
+        self: &Arc<Self>,
+        chunk: &[u8],
+    ) -> Arc<StoredChunkRef<CHUNK_SIZE, C>> {
+        assert!(chunk.len() <= CHUNK_SIZE);
+
+        let crc = crc32fast::hash(chunk);
+        let mut crc_map = self.crc_map.write().unwrap();
 
         // check crc
-        if let Some(slab_ref) = self.crc.get(&crc) {
-            match slab_ref {
-                WeakSlabRefs::One(weak_ref) => {
-                    if let Some(stored_slab) = weak_ref.upgrade() {
-                        if stored_slab.as_bytes() == slab {
-                            debug!(id = %stored_slab.id(), "dup slab found");
-                            return Ok(stored_slab);
+        if let Some(chunk_ref) = crc_map.get(&crc) {
+            match chunk_ref {
+                WeakChunkRefs::One(weak_ref) => {
+                    if let Some(stored_chunk) = weak_ref.upgrade() {
+                        if stored_chunk.as_bytes() == chunk {
+                            // debug!(id = %stored_chunk.id(), "dup slab found");
+                            return stored_chunk;
                         }
                     }
                 }
-                WeakSlabRefs::Many(slab_refs) => {
-                    for slab_ref in slab_refs {
-                        if let Some(stored_slab) = slab_ref.upgrade() {
-                            if stored_slab.as_bytes() == slab {
-                                debug!(id = %stored_slab.id(), "dup slab found");
-                                return Ok(stored_slab);
+                WeakChunkRefs::Many(chunk_refs) => {
+                    for chunk_ref in chunk_refs {
+                        if let Some(stored_chunk) = chunk_ref.upgrade() {
+                            if stored_chunk.as_bytes() == chunk {
+                                // debug!(id = %stored_chunk.id(), "dup slab found");
+                                return stored_chunk;
                             }
                         }
                     }
@@ -141,53 +84,56 @@ impl Pool {
         }
 
         // store new slab
-        let mut slab_mut = self
+        let mut chunk_mut = self
             .inner
             .clone()
             .create_owned()
             .expect("fail to create_owned");
-        slab_mut.store(slab);
-        let slab = slab_mut.downgrade();
-        self.inner.clear(slab.key());
-        let slab = Arc::new(SlabRef {
-            inner: Some(slab),
-            tx: self.tx.clone(),
+        chunk_mut.copy_from_slice(chunk);
+        let chunk = chunk_mut.downgrade();
+        self.inner.clear(chunk.key());
+        let chunk = Arc::new(StoredChunkRef {
+            inner: Some(chunk),
+            pool: self.clone(),
         });
+        self.chunk_count.fetch_add(1, Ordering::Relaxed);
 
         // store weak ref into crc map
-        match self.crc.entry(crc) {
+        match crc_map.entry(crc) {
             Entry::Occupied(mut entry) => {
                 let value = entry.get_mut();
                 match value {
-                    WeakSlabRefs::One(slab_ref) => {
-                        *value = WeakSlabRefs::Many(vec![slab_ref.clone(), Arc::downgrade(&slab)]);
+                    WeakChunkRefs::One(chunk_ref) => {
+                        *value =
+                            WeakChunkRefs::Many(vec![chunk_ref.clone(), Arc::downgrade(&chunk)]);
                     }
-                    WeakSlabRefs::Many(slab_refs) => {
-                        slab_refs.push(Arc::downgrade(&slab));
+                    WeakChunkRefs::Many(chunk_refs) => {
+                        chunk_refs.push(Arc::downgrade(&chunk));
                     }
                 }
             }
             Entry::Vacant(entry) => {
-                entry.insert(WeakSlabRefs::One(Arc::downgrade(&slab)));
+                entry.insert(WeakChunkRefs::One(Arc::downgrade(&chunk)));
             }
         }
 
-        Ok(slab)
+        chunk
     }
 
-    pub fn clear_crc(&mut self, crc: u32) {
-        let Entry::Occupied(mut entry) = self.crc.entry(crc) else {
+    pub(crate) fn clear_crc(self: &Arc<Self>, crc: u32) {
+        let mut crc_map = self.crc_map.write().unwrap();
+        let Entry::Occupied(mut entry) = crc_map.entry(crc) else {
             unreachable!()
         };
 
         let mut remove_entry = false;
 
         match entry.get_mut() {
-            WeakSlabRefs::One(slab_ref) => {
+            WeakChunkRefs::One(slab_ref) => {
                 assert!(slab_ref.upgrade().is_none());
                 remove_entry = true;
             }
-            WeakSlabRefs::Many(ref mut slab_refs) => {
+            WeakChunkRefs::Many(ref mut slab_refs) => {
                 let mut remove_index = None;
                 for (i, slab_ref) in slab_refs.iter().enumerate() {
                     if slab_ref.upgrade().is_none() {
@@ -206,75 +152,167 @@ impl Pool {
             entry.remove();
         }
     }
+
+    pub fn store_from_buf(self: &Arc<Self>, buf: &mut impl bytes::Buf) -> Slabytes<CHUNK_SIZE, C> {
+        if !buf.has_remaining() {
+            return Slabytes::new();
+        }
+        let mut slabytes = Slabytes::with_capacity(buf.remaining());
+        while buf.has_remaining() {
+            let len = std::cmp::min(buf.remaining(), CHUNK_SIZE);
+            let bytes = buf.copy_to_bytes(len);
+            let inner = self.store_chunk(&bytes);
+            slabytes.append(crate::slabytes::Chunk::from(inner));
+        }
+        slabytes
+    }
+
+    pub fn store_from_bytes(self: &Arc<Self>, mut bytes: bytes::Bytes) -> Slabytes<CHUNK_SIZE, C> {
+        self.store_from_buf(&mut bytes)
+    }
+
+    pub fn store_from_std_reader(
+        self: &Arc<Self>,
+        reader: &mut impl std::io::Read,
+    ) -> std::io::Result<Slabytes<CHUNK_SIZE, C>> {
+        use bytes::BytesMut;
+
+        let mut slabytes = Slabytes::new();
+        let mut eof = false;
+
+        loop {
+            let mut bytes_mut = BytesMut::zeroed(CHUNK_SIZE);
+
+            let mut buf = bytes_mut.as_mut();
+            while !buf.is_empty() {
+                match reader.read(buf) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        let tmp = buf;
+                        buf = &mut tmp[n..];
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let len = CHUNK_SIZE - buf.len();
+
+            if len > 0 {
+                let bytes = bytes_mut.freeze().split_to(len);
+                let inner = self.clone().store_chunk(&bytes);
+                slabytes.append(crate::slabytes::Chunk::from(inner));
+            }
+
+            if eof {
+                break;
+            }
+        }
+
+        Ok(slabytes)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub async fn store_from_async_reader(
+        self: &Arc<Self>,
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> std::io::Result<Slabytes<CHUNK_SIZE, C>> {
+        use bytes::BytesMut;
+        use std::future::poll_fn;
+        use std::pin::Pin;
+        use tokio::io::ReadBuf;
+
+        let mut slabytes = Slabytes::new();
+        let mut eof = false;
+
+        loop {
+            let mut bytes_mut = BytesMut::zeroed(CHUNK_SIZE);
+
+            let mut buf = ReadBuf::new(bytes_mut.as_mut());
+            while buf.remaining() > 0 {
+                let remaining = buf.remaining();
+                poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut buf)).await?;
+                if buf.remaining() == remaining {
+                    eof = true;
+                    break;
+                }
+            }
+            let len = CHUNK_SIZE - buf.remaining();
+
+            if len > 0 {
+                let bytes = bytes_mut.freeze().split_to(len);
+                let inner = self.clone().store_chunk(&bytes);
+                slabytes.append(crate::slabytes::Chunk::from(inner));
+            }
+
+            if eof {
+                break;
+            }
+        }
+
+        Ok(slabytes)
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct Slab {
-    data: Box<[u8; SLAB_SIZE]>,
+struct Chunk<const SIZE: usize> {
+    data: [u8; SIZE],
     len: usize,
-    id: usize,
 }
 
-impl Default for Slab {
+impl<const SIZE: usize> Default for Chunk<SIZE> {
     fn default() -> Self {
-        let id = ALLOCATED_SLAB_COUNT.fetch_add(1, Ordering::Relaxed);
-        debug!(%id, "slab allocated");
         Self {
-            data: Box::new([0; SLAB_SIZE]),
+            data: [0; SIZE],
             len: 0,
-            id,
         }
     }
 }
 
-impl sharded_slab::Clear for Slab {
+impl<const SIZE: usize> sharded_slab::Clear for Chunk<SIZE> {
     fn clear(&mut self) {
-        debug!(id=%self.id, "clear slab");
         self.len = 0;
     }
 }
 
-impl Slab {
+impl<const SIZE: usize> Chunk<SIZE> {
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
+    fn as_bytes(&self) -> &[u8] {
         &self.data[0..self.len]
     }
 
     #[inline]
-    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
         &mut self.data[0..self.len]
     }
 
-    pub fn store(&mut self, slice: &[u8]) {
-        assert!(slice.len() <= SLAB_SIZE);
+    fn copy_from_slice(&mut self, slice: &[u8]) {
+        assert!(slice.len() <= SIZE);
         self.len = slice.len();
         self.as_mut_bytes().copy_from_slice(slice);
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct SlabRef {
-    inner: Option<OwnedRef<Slab>>,
-    tx: mpsc::Sender<Message>,
+pub(crate) struct StoredChunkRef<const SIZE: usize, C: Config> {
+    inner: Option<OwnedRef<Chunk<SIZE>, C>>,
+    pool: Arc<Pool<SIZE, C>>,
 }
 
-impl Drop for SlabRef {
+impl<const SIZE: usize, C: Config> Drop for StoredChunkRef<SIZE, C> {
     fn drop(&mut self) {
         let slab_ref = self.inner.take().unwrap();
         let crc = crc32fast::hash(slab_ref.as_bytes());
-        self.tx
-            .send(Message::Drop { slab_ref, crc })
-            .expect("fail to send Message::Drop");
+        self.pool.clear_crc(crc);
+        self.pool.chunk_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-impl SlabRef {
+impl<const SIZE: usize, C: Config> StoredChunkRef<SIZE, C> {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         self.inner.as_ref().unwrap().as_bytes()
-    }
-
-    fn id(&self) -> usize {
-        self.inner.as_ref().unwrap().id
     }
 }

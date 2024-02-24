@@ -2,39 +2,40 @@ use super::*;
 use bytes::{Buf, Bytes};
 use std::io::Write;
 
-fn gen_uniq_chunk() -> [u8; SLAB_SIZE] {
+fn gen_uniq_chunk<const SIZE: usize>() -> [u8; SIZE] {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let id = COUNT.fetch_add(1, Ordering::Relaxed);
     let id_buf = id.to_be_bytes();
-    let mut chunk = [0; SLAB_SIZE];
-    chunk[SLAB_SIZE - std::mem::size_of::<usize>()..].copy_from_slice(&id_buf);
+    let mut chunk = [0; SIZE];
+    chunk[SIZE - std::mem::size_of::<usize>()..].copy_from_slice(&id_buf);
     chunk
 }
 
-fn gen_uniq_chunk_bytes(chunk_count: usize) -> bytes::Bytes {
-    let mut vec = Vec::with_capacity(SLAB_SIZE * chunk_count);
+fn gen_uniq_chunk_bytes<const SIZE: usize>(chunk_count: usize) -> bytes::Bytes {
+    let mut vec = Vec::with_capacity(SIZE * chunk_count);
     for _ in 0..chunk_count {
-        vec.write_all(&gen_uniq_chunk()).unwrap();
+        vec.write_all(&gen_uniq_chunk::<SIZE>()).unwrap();
     }
-    assert_eq!(vec.len(), SLAB_SIZE * chunk_count);
+    assert_eq!(vec.len(), SIZE * chunk_count);
     vec.into()
 }
 
 #[test]
 fn test() {
-    use sharded_slab::{Config, DefaultConfig};
-    const INITIAL_PAGE_SIZE: usize = DefaultConfig::INITIAL_PAGE_SIZE;
+    const CHUNK_SIZE: usize = 512;
+    let pool = Pool::<CHUNK_SIZE>::new();
+    assert_eq!(pool.chunk_size(), CHUNK_SIZE);
 
-    let bytes1 = gen_uniq_chunk_bytes(3);
-    let slabytes1 = Slabytes::from(bytes1.clone());
+    let bytes1 = gen_uniq_chunk_bytes::<CHUNK_SIZE>(3);
+    let slabytes1 = pool.store_from_bytes(bytes1.clone());
     // 3 chunks stored
-    assert_eq!(crate::allocated_slab_count(), INITIAL_PAGE_SIZE);
+    assert_eq!(pool.stored_chunk_count(), 3);
 
-    assert_eq!(slabytes1.slabs.len(), 3);
-    for slab in slabytes1.clone().slabs {
-        assert_eq!(slab.remaining(), SLAB_SIZE);
+    assert_eq!(slabytes1.chunks.len(), 3);
+    for chunk in slabytes1.clone().chunks {
+        assert_eq!(chunk.remaining(), pool.chunk_size());
     }
     assert_eq!(
         slabytes1.clone().copy_to_bytes(slabytes1.remaining()),
@@ -42,26 +43,30 @@ fn test() {
     );
 
     let bytes2 = Bytes::from(vec![2; 300]);
-    let slabytes2 = Slabytes::from(bytes2.clone());
+    let slabytes2 = pool.store_from_bytes(bytes2.clone());
     // store 1 chunk (total 4 chunks used)
-    assert_eq!(slabytes2.slabs.len(), 1);
-    assert_eq!(slabytes2.slabs[0].chunk(), &[2; 300]);
+    assert_eq!(pool.stored_chunk_count(), 4);
+
+    assert_eq!(slabytes2.chunks.len(), 1);
+    assert_eq!(slabytes2.chunks[0].chunk(), &[2; 300]);
     assert_eq!(
         slabytes2.clone().copy_to_bytes(slabytes2.remaining()),
         bytes2
     );
 
     drop(slabytes1); // clear 3 chunks (total 1 chunk used)
+    assert_eq!(pool.stored_chunk_count(), 1);
 
-    let bytes3 = gen_uniq_chunk_bytes(31);
-    let slabytes3 = Slabytes::from(bytes3.clone());
+    let bytes3 = gen_uniq_chunk_bytes::<CHUNK_SIZE>(31);
+    let slabytes3 = pool.store_from_bytes(bytes3.clone());
     // store 31 chunks (3 chunks reused, total 32 chunks used)
-    assert_eq!(crate::allocated_slab_count(), INITIAL_PAGE_SIZE);
+    assert_eq!(pool.stored_chunk_count(), 32);
+
     {
         let mut obj = slabytes3.clone();
         while obj.has_remaining() {
             let chunk = obj.chunk();
-            assert_eq!(chunk.len(), SLAB_SIZE);
+            assert_eq!(chunk.len(), pool.chunk_size());
             obj.advance(chunk.len());
         }
     }
@@ -70,101 +75,50 @@ fn test() {
         bytes3
     );
 
-    // https://docs.rs/sharded-slab/latest/sharded_slab/implementation/index.html
-
-    let _slabytes4 = Slabytes::from(gen_uniq_chunk_bytes(INITIAL_PAGE_SIZE * 2));
-    assert_eq!(
-        crate::allocated_slab_count(),
-        INITIAL_PAGE_SIZE + INITIAL_PAGE_SIZE * 2
-    );
-
-    let slabytes5 = Slabytes::from_buf_blocking(&mut vec![5; SLAB_SIZE].as_slice());
-    assert_eq!(
-        crate::allocated_slab_count(),
-        INITIAL_PAGE_SIZE + INITIAL_PAGE_SIZE * 2 + INITIAL_PAGE_SIZE * 4
-    );
-    drop(slabytes5);
-
-    let slabytes6 = Slabytes::from(gen_uniq_chunk_bytes(INITIAL_PAGE_SIZE * 4));
-    assert_eq!(
-        crate::allocated_slab_count(),
-        INITIAL_PAGE_SIZE + INITIAL_PAGE_SIZE * 2 + INITIAL_PAGE_SIZE * 4
-    );
-    drop(slabytes6);
-
-    let slabytes = Slabytes::from_buf_blocking(&mut vec![0; SLAB_SIZE * 4].as_slice());
-    assert_eq!(slabytes.remaining(), SLAB_SIZE * 4);
+    let slabytes = pool.store_from_buf(&mut &[0; CHUNK_SIZE * 16][..]);
+    assert_eq!(slabytes.remaining(), CHUNK_SIZE * 16);
     {
         let mut obj = slabytes.clone();
         while obj.has_remaining() {
             let chunk = obj.chunk();
-            assert_eq!(chunk.len(), SLAB_SIZE);
-            assert_eq!(chunk, &[0; SLAB_SIZE]);
+            assert_eq!(chunk.len(), CHUNK_SIZE);
+            assert_eq!(chunk, &[0; CHUNK_SIZE]);
             obj.advance(chunk.len());
         }
     }
+    assert_eq!(pool.stored_chunk_count(), 33);
 
-    let slabytes = Slabytes::from_buf_blocking(&mut &[0; SLAB_SIZE * 16][..]);
-    assert_eq!(slabytes.remaining(), SLAB_SIZE * 16);
-    {
-        let mut obj = slabytes.clone();
-        while obj.has_remaining() {
-            let chunk = obj.chunk();
-            assert_eq!(chunk.len(), SLAB_SIZE);
-            assert_eq!(chunk, &[0; SLAB_SIZE]);
-            obj.advance(chunk.len());
-        }
-    }
-    let slabytes = Slabytes::from_buf_blocking(&mut &b"01234"[..]);
-    assert_eq!(slabytes.chunk(), b"01234");
-    drop(slabytes);
-
-    let mut slabytes =
-        Slabytes::from_std_reader(&mut &[0; SLAB_SIZE * INITIAL_PAGE_SIZE * 8][..]).unwrap();
+    let mut slabytes = pool
+        .store_from_std_reader(&mut &[0; CHUNK_SIZE * 16][..])
+        .unwrap();
     assert_eq!(
         &slabytes.copy_to_bytes(slabytes.remaining())[..],
-        &[0; SLAB_SIZE * INITIAL_PAGE_SIZE * 8][..]
+        &[0; CHUNK_SIZE * 16][..]
     );
+    assert_eq!(pool.stored_chunk_count(), 33);
+}
 
-    assert_eq!(
-        crate::allocated_slab_count(),
-        INITIAL_PAGE_SIZE + INITIAL_PAGE_SIZE * 2 + INITIAL_PAGE_SIZE * 4
-    );
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_read() {
+    use tokio::io::AsyncReadExt;
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            use tokio::io::AsyncReadExt;
+    const CHUNK_SIZE: usize = 512;
+    let pool = Pool::<CHUNK_SIZE>::new();
+    assert_eq!(pool.chunk_size(), CHUNK_SIZE);
 
-            let vec1_in = vec![1; SLAB_SIZE];
-            let mut obj1 = Slabytes::from_buf(&mut &vec1_in[..]).await;
-            assert_eq!(obj1.slabs.len(), 1);
-            assert_eq!(obj1.slabs[0].chunk(), &[1; SLAB_SIZE]);
-            let mut vec1_out = vec![];
-            obj1.read_to_end(&mut vec1_out).await.unwrap();
-            assert_eq!(vec1_out, vec1_in);
-
-            let vec2_in = vec![2; SLAB_SIZE * 2];
-            let mut obj2 = Slabytes::from_buf(&mut &vec2_in[..]).await;
-            assert_eq!(obj2.slabs.len(), 2);
-            assert_eq!(obj2.slabs[0].chunk(), &[2; SLAB_SIZE]);
-            assert_eq!(obj2.slabs[1].chunk(), &[2; SLAB_SIZE]);
-            let mut vec2_out = vec![];
-            obj2.read_to_end(&mut vec2_out).await.unwrap();
-            assert_eq!(vec2_out, vec2_in);
-
-            let vec3_in = vec![3; SLAB_SIZE * 3];
-            let mut obj3 = Slabytes::from_async_reader(&mut &vec3_in[..])
-                .await
-                .unwrap();
-            assert_eq!(obj3.slabs.len(), 3);
-            assert_eq!(obj3.slabs[0].chunk(), &[3; SLAB_SIZE]);
-            assert_eq!(obj3.slabs[1].chunk(), &[3; SLAB_SIZE]);
-            assert_eq!(obj3.slabs[2].chunk(), &[3; SLAB_SIZE]);
-            let mut vec3_out = vec![];
-            obj3.read_to_end(&mut vec3_out).await.unwrap();
-            assert_eq!(vec3_out, vec3_in);
-        })
+    let vec_in = vec![3; CHUNK_SIZE * 3];
+    let mut obj = pool
+        .store_from_async_reader(&mut &vec_in[..])
+        .await
+        .unwrap();
+    assert_eq!(obj.chunks.len(), 3);
+    assert_eq!(obj.chunks[0].chunk(), &[3; CHUNK_SIZE]);
+    assert_eq!(obj.chunks[1].chunk(), &[3; CHUNK_SIZE]);
+    assert_eq!(obj.chunks[2].chunk(), &[3; CHUNK_SIZE]);
+    assert_eq!(pool.stored_chunk_count(), 1);
+    let mut vec_out = vec![];
+    obj.read_to_end(&mut vec_out).await.unwrap();
+    assert_eq!(vec_out, vec_in);
+    assert_eq!(pool.stored_chunk_count(), 0);
 }
