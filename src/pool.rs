@@ -133,7 +133,7 @@ impl<const CHUNK_SIZE: usize, C: Config> Pool<CHUNK_SIZE, C> {
                 assert!(slab_ref.upgrade().is_none());
                 remove_entry = true;
             }
-            WeakChunkRefs::Many(ref mut slab_refs) => {
+            WeakChunkRefs::Many(slab_refs) => {
                 let mut remove_index = None;
                 for (i, slab_ref) in slab_refs.iter().enumerate() {
                     if slab_ref.upgrade().is_none() {
